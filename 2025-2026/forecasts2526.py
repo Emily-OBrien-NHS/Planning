@@ -14,7 +14,7 @@ covid_bool = True
 #(THIS MAY NEED TO CHANGE ONCE NOVEMBER, AS OCTOBER MAY BE OK TO USE).
 NEL_plus1_bool = True
 #Define forecast period (april25-march26)
-pred_period = pd.DataFrame(pd.date_range('2025-04-01', '2026-03-01', freq='MS'),
+pred_period = pd.DataFrame(pd.date_range('2025-04-01', '2031-03-01', freq='MS'),
                            columns=['monthstartdate'])
 pred_period['Month'] = pred_period['monthstartdate'].dt.month
 pred_period['Data'] = 'Forecast Period'
@@ -177,7 +177,7 @@ cl3_engine.dispose()
 ###############################Function to calculate forecasts
 def demand_forecasting(df, groupby_cols, NEL):
     ###############################Get a dataframe of the unique groups
-    groups = df[groupby_cols].drop_duplicates()
+    groups = df[groupby_cols].sort_values(by=groupby_cols).drop_duplicates()
     groups['key'] = 0 
     ###############################Get current position rows
     #(first date of prev month so using whole month)
@@ -342,12 +342,41 @@ def demand_forecasting(df, groupby_cols, NEL):
     #change between years for each group.
     scalar_df['scalar'] = scalar_df.groupby(groupby_cols)['sum'].pct_change()+1
     scalar_df = scalar_df.groupby(groupby_cols, as_index=False)['scalar'].mean()
+    #If forecasting multiple years, apply scalar to each increasing each time.
+    #Iterate over each group and increase it's scalar for each year forecasted
+    iterator = (pd.DataFrame(forecast_df['LoSGroup'].sort_values()
+                             .drop_duplicates(), columns=['LoSGroup'])
+                if NEL else groups[groupby_cols])
+    forecast_df['year'] = forecast_df['monthstartdate'].dt.year
+    years = forecast_df['year'].drop_duplicates().values.tolist()
+    increasing_scalars = []
+    for index, group in iterator.iterrows():
+        #for each group, merge to that group to get it's trend data
+        group_df = pd.DataFrame({col:group[col] for col in groupby_cols},
+                                index=[0])
+        scalar_data = scalar_df.merge(group_df, on=list(groupby_cols),
+                                      how='inner')
+        original_scalar = scalar_data.loc[0, 'scalar']
+        scalar = original_scalar.copy()
+        #Append orignal scalar, then loop over the years to increase each years
+        #scalar value
+        increasing_scalars.append(scalar)
+        for year in range(len(years)-1):
+            scalar *= original_scalar
+            increasing_scalars.append(scalar)
+    #cross join the years onto the scalars and add in each groups
+    #increasing scalars
+    scalar_df = (pd.DataFrame(years, columns=['year'])
+                 .join(scalar_df, how='cross')
+                 .sort_values(by=groupby_cols + ['year']))
+    scalar_df['scalar'] = increasing_scalars
+    #Add in group column if not NEL
     if not NEL:
         #Add Group column to merge on if not NEL data
         scalar_df['Group'] = (scalar_df[groupby_cols].apply(tuple, axis=1)
                               .values.tolist())
     #Merge forecast onto scalar dataframe and apply uplift to the forecast
-    forecast_df = forecast_df.merge(scalar_df, on=merge_col)
+    forecast_df = forecast_df.merge(scalar_df, on=[merge_col, 'year'])
     forecast_df['Forecast'] = (forecast_df['Forecast']
                                * forecast_df['scalar']).astype(int)
     #Select only required columns
@@ -428,8 +457,10 @@ NEL_table = create_data_forecast_table(NEL_df_sum, NEL_forecast_sum,
 ###############################Combine into one and create an excel output
 combined = pd.concat([UEC_ED_table, UEC_PERIPH_table,
                       AMB_table, NEL_table]).round()
+yellows = ['#ffcc00', '#ffcc00', 'ffff66', 'ffff66', 'ffff99', 'ffff99', 'ffffcc', 'ffffcc', 'ffffcc']
+today = datetime.today()
 writer = pd.ExcelWriter(
-         f"Demand Forecast Compare {datetime.today().strftime('%Y-%m-%d')}.xlsx",
+         f"G:/PerfInfo/Performance Management/PIT Adhocs/2024-2025/Emily 2425/UEC Forecasting/Demand Forecast {today.strftime('%Y-%m-%d')}.xlsx",
          engine='xlsxwriter')
 workbook = writer.book
 #create one sheet for each group
@@ -440,20 +471,21 @@ for group in combined['Group'].values.tolist():
     group_df.to_excel(writer, sheet_name=sheet_name, index=False,
                       engine='xlsxwriter')
     worksheet = writer.sheets[sheet_name]
-    max_rows = len(group_df)
+    max_past_rows = len(group_df.loc[group_df['year'] <= today.year])
+    max_forec_rows = len(group_df.loc[group_df['year'] > today.year])
     #Add line chart
     #Get a list of HTML greyscale values to use for the n past years in the
     #chart add 2 yellow at the end for the forecast
     HTML_greyscale = (['#%02x%02x%02x' % (n, n, n) for n in
-                      [round(i) for i in np.linspace(250, 0, max_rows-2)]]
-                      + ['#ffcc00', '#ffcc00'])
+                      [round(i) for i in np.linspace(250, 0, max_past_rows)]]
+                      + yellows[:max_forec_rows])
     # Create a chart object.
     chart = workbook.add_chart({"type": "line"})
     years = group_df['year'].drop_duplicates().values.tolist()
     #loop over each year and plot the data
     for i, year in enumerate(years):
         row = i+1
-        width = 1.5 if i < max_rows-2 else 3 #forecast to be thicker lines
+        width = 1.5 if (i < max_past_rows) or (i > max_past_rows + 1) else 3 #forecast to be thicker lines
         chart.add_series({'name':str(year),
                           'values':[sheet_name, row, 2, row, 13],
                           'line':{'color' : HTML_greyscale[i],
